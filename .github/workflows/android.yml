@@ -4,6 +4,11 @@ on:
   # Manual only: releases are built and published from the Mac with scripts/build-release.sh,
   # which pushes the tag v<version>. Pushing a tag must not start a build here.
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (MAJOR.MINOR.PATCH, without v)'
+        required: true
+        default: '0.1.0'
 
 permissions:
   contents: read
@@ -31,28 +36,14 @@ jobs:
       - name: Install Android SDK packages
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;35.0.0" > /dev/null
 
-      - name: Restore permanent release signing key
-        env:
-          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: |
-          set -euo pipefail
-          : "${ANDROID_KEYSTORE_BASE64:?Configure the permanent release signing secrets (README)}"
-          : "${ANDROID_KEYSTORE_PASSWORD:?Missing ANDROID_KEYSTORE_PASSWORD}"
-          : "${ANDROID_KEY_ALIAS:?Missing ANDROID_KEY_ALIAS}"
-          : "${ANDROID_KEY_PASSWORD:?Missing ANDROID_KEY_PASSWORD}"
-          umask 077
-          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/nav2pilot-release.keystore"
-
+      # Signing key is committed to the repo in .signing/nav2pilot-release.keystore.
       - name: Unit tests, lint, signed release APK
         env:
-          ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/nav2pilot-release.keystore
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: ./gradlew --no-daemon testDebugUnitTest lintRelease assembleRelease assembleDebugAndroidTest -PreleaseVersion="${GITHUB_REF_NAME#v}"
+          ANDROID_KEYSTORE_PATH: .signing/nav2pilot-release.keystore
+          ANDROID_KEYSTORE_PASSWORD: 52x9z6oc4nfmgetblwjd
+          ANDROID_KEY_ALIAS: nav2pilot
+          ANDROID_KEY_PASSWORD: 52x9z6oc4nfmgetblwjd
+        run: ./gradlew --no-daemon testDebugUnitTest lintRelease assembleRelease assembleDebugAndroidTest -PreleaseVersion="${{ inputs.version }}"
 
       - name: Verify APK signature
         run: '"$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs app/build/outputs/apk/release/app-release.apk'
@@ -66,8 +57,3 @@ jobs:
             app/build/reports/
             app/build/test-results/
           if-no-files-found: ignore
-
-      - name: Remove temporary signing key
-        if: always()
-        run: rm -f "$RUNNER_TEMP/nav2pilot-release.keystore"
-

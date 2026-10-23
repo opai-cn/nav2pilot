@@ -13,9 +13,9 @@ captures/
 # Local configuration (SDK path, signing secrets)
 local.properties
 *.jks
-*.keystore
 keystore.properties
-.signing/
+*.keystore
+!.signing/nav2pilot-release.keystore
 
 # macOS
 .DS_Store
