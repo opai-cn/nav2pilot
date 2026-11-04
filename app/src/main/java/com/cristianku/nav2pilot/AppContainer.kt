@@ -16,15 +16,18 @@ import com.cristianku.nav2pilot.mapbox.MapboxSetup
 import com.cristianku.nav2pilot.mapbox.MapboxTokenVerifier
 import com.cristianku.nav2pilot.mapbox.RoutePlanning
 import com.cristianku.nav2pilot.net.UrlConnectionHttpClient
+import com.cristianku.nav2pilot.places.OverpassPlaces
 import com.cristianku.nav2pilot.resolve.DestinationResolver
 import com.cristianku.nav2pilot.resolve.ShortLinkResolver
 import com.cristianku.nav2pilot.security.KeystoreTokenCipher
 import com.cristianku.nav2pilot.security.TokenStore
 import com.cristianku.nav2pilot.transport.CommaAthenaTransport
+import com.cristianku.nav2pilot.transport.DestinationSender
 import com.cristianku.nav2pilot.transport.SunnylinkTransport
 import com.cristianku.nav2pilot.transport.TransportRegistry
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /** Manual dependency wiring: one instance of each service for the whole app. */
 class AppContainer(context: Context) {
@@ -48,6 +51,8 @@ class AppContainer(context: Context) {
         directions = MapboxDirections(httpClient, { mapbox.tokenStore.load() }, ioDispatcher),
         location = AndroidLocationProvider(context),
     )
+    // points of interest on the map, from OpenStreetMap (Overpass API, no key)
+    val places = OverpassPlaces(httpClient, ioDispatcher)
     val favoritesRepository = FavoritesRepository(dataStore)
     val deviceRepository = DeviceRepository(dataStore)
 
@@ -57,6 +62,8 @@ class AppContainer(context: Context) {
         ioDispatcher = ioDispatcher,
     )
     val transports = TransportRegistry(commaTransport, SunnylinkTransport())
+    /** The car screen's sends; the phone's go through MainViewModel, with the same sender. */
+    val sender = DestinationSender(transports) { withContext(ioDispatcher) { mapbox.tokenStore.load() } }
 
     val placeSearch: PlaceSearch = AndroidGeocoderSearch(context.applicationContext, ioDispatcher)
     val destinationResolver = DestinationResolver(ShortLinkResolver(httpClient), placeSearch, ioDispatcher)

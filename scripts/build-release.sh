@@ -10,7 +10,9 @@
 #   scripts/build-release.sh --local      only builds, does not publish
 #
 # Needs keystore.properties, the keystore and the Play service account key
-# (.signing/play-service-account.json), all ignored by git, see README.
+# (.signing/play-service-account.json), all ignored by git, see README; or, e.g. on a build server,
+# keystore.properties + keystore in $NAV2PILOT_SECRETS (default ~/.secrets/nav2pilot) and the
+# service account, shared by all the apps, in $SHARED_SECRETS (default ~/.secrets/shared).
 # The first version of the app must have been uploaded by hand in Play Console.
 # APK and AAB end up in build/nav2pilot-v<version>.apk and .aab.
 set -euo pipefail
@@ -21,7 +23,17 @@ cd "$REPO"
 # certificate of the permanent release key (v1.0.3 and later)
 EXPECTED_CERT="79be28ef7cc9118c3547a28fbc327f776e8bff7aeb37705be7ff01c6ba5d4164"
 
+# secrets: in the repo (ignored by git) or in the machine-level folder, same rule as app/build.gradle.kts
+SECRETS="${NAV2PILOT_SECRETS:-$HOME/.secrets/nav2pilot}"
+SHARED="${SHARED_SECRETS:-$HOME/.secrets/shared}"
 PLAY_KEY=".signing/play-service-account.json"
+if [ ! -f "$PLAY_KEY" ]; then
+  PLAY_KEY="$SHARED/play-service-account.json"
+fi
+KEYSTORE_PROPERTIES="keystore.properties"
+if [ ! -f "$KEYSTORE_PROPERTIES" ]; then
+  KEYSTORE_PROPERTIES="$SECRETS/keystore.properties"
+fi
 
 VERSION=""
 INSTALL="no"
@@ -80,16 +92,30 @@ if [ "$PUBLISH" = "yes" ]; then
   fi
 fi
 
-if [ ! -f keystore.properties ]; then
-  echo "keystore.properties is missing: without it the APK cannot be signed with the release key."
+if [ ! -f "$KEYSTORE_PROPERTIES" ]; then
+  echo "keystore.properties is missing (repo or $SECRETS): without it the APK cannot be signed with the release key."
   exit 1
 fi
 
 # the pinned Android Gradle Plugin 8.0 needs JDK 17
-JAVA_HOME="$(/usr/libexec/java_home -v 17)"
+if [ -x /usr/libexec/java_home ]; then
+  JAVA_HOME="$(/usr/libexec/java_home -v 17)"
+elif [ -d /usr/lib/jvm/temurin-17-jdk-amd64 ]; then
+  JAVA_HOME="/usr/lib/jvm/temurin-17-jdk-amd64"
+elif [ -d /usr/lib/jvm/java-17-openjdk-amd64 ]; then
+  JAVA_HOME="/usr/lib/jvm/java-17-openjdk-amd64"
+fi
 export JAVA_HOME
 
-SDK="$HOME/Library/Android/sdk"
+# Android SDK: $ANDROID_HOME, else the Mac default, else the build server one (/opt/android-sdk)
+if [ -n "${ANDROID_HOME:-}" ]; then
+  SDK="$ANDROID_HOME"
+elif [ -d "$HOME/Library/Android/sdk" ]; then
+  SDK="$HOME/Library/Android/sdk"
+else
+  SDK="/opt/android-sdk"
+fi
+export ANDROID_HOME="$SDK"
 BUILD_TOOLS="$(ls -d "$SDK"/build-tools/* | sort -V | tail -1)"
 
 echo "== tests and signed release build ($VERSION)"
@@ -116,7 +142,10 @@ if [ "$AAB_CERT" != "$EXPECTED_CERT" ]; then
   exit 1
 fi
 echo "signed with the release key: ok"
-"$BUILD_TOOLS/aapt" dump badging "$APK" | head -1 | grep -o "versionCode='[0-9]*' versionName='[^']*'"
+# first line without head in a pipe: head closing early kills aapt (SIGPIPE, exit 141) under pipefail
+BADGING="$("$BUILD_TOOLS/aapt" dump badging "$APK")"
+FIRST_LINE="${BADGING%%$'\n'*}"
+echo "$FIRST_LINE" | grep -o "versionCode='[0-9]*' versionName='[^']*'"
 
 if [ "$INSTALL" = "yes" ]; then
   echo "== install on the phone"

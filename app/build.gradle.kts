@@ -26,8 +26,28 @@ val releaseVersionCode = releaseVersion?.let { version ->
     code.toInt()
 }
 
+// Secrets are read from the repo first, then from the machine-level folder
+// NAV2PILOT_SECRETS (default ~/.secrets/nav2pilot), so a fresh clone needs nothing copied into it.
+val machineSecretsDir = File(
+    providers.environmentVariable("NAV2PILOT_SECRETS").orNull
+        ?: (System.getProperty("user.home") + "/.secrets/nav2pilot")
+)
+// Secrets used by every app of the account (Play service account) live in the shared folder
+// SHARED_SECRETS (default ~/.secrets/shared).
+val sharedSecretsDir = File(
+    providers.environmentVariable("SHARED_SECRETS").orNull
+        ?: (System.getProperty("user.home") + "/.secrets/shared")
+)
+fun secretFile(repoPath: String, machineDir: File, machineName: String): File {
+    val repoFile = rootProject.file(repoPath)
+    if (repoFile.isFile) {
+        return repoFile
+    }
+    return File(machineDir, machineName)
+}
+
 val localSigning = Properties().apply {
-    val propertiesFile = rootProject.file("keystore.properties")
+    val propertiesFile = secretFile("keystore.properties", machineSecretsDir, "keystore.properties")
     if (propertiesFile.isFile) propertiesFile.inputStream().use { load(it) }
 }
 fun signingValue(environmentName: String, propertyName: String): String? =
@@ -93,6 +113,8 @@ android {
 
     testOptions {
         unitTests.isReturnDefaultValues = false
+        // Robolectric (car screen tests) reads the app's resources and manifest
+        unitTests.isIncludeAndroidResources = true
     }
 
     lint {
@@ -104,10 +126,13 @@ android {
     }
 }
 
-// Google Play upload with the service account key in .signing/ (ignored by git, see README).
+// Google Play upload with the service account key in .signing/ (ignored by git, see README)
+// or in the shared secrets folder.
 // The track can be changed from the command line: ./gradlew publishReleaseBundle --track alpha
 play {
-    serviceAccountCredentials.set(rootProject.file(".signing/play-service-account.json"))
+    serviceAccountCredentials.set(
+        secretFile(".signing/play-service-account.json", sharedSecretsDir, "play-service-account.json")
+    )
     track.set("internal")
     defaultToAppBundles.set(true)
 }
@@ -147,6 +172,8 @@ dependencies {
     // Base map from OpenFreeMap (free, no key), or Mapbox Streets raster tiles with the user's own public token,
     // so that Mapbox routes are shown on a Mapbox map.
     implementation("org.maplibre.gl:android-sdk:13.6.1")
+    // Android Auto screen (car/): templates drawn by Android Auto
+    implementation("androidx.car.app:app:1.7.0")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 
@@ -154,6 +181,10 @@ dependencies {
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
     // Real org.json for JVM unit tests (android.jar only ships stubs).
     testImplementation("org.json:json:20230618")
+    // The car screens' templates, built and checked by the Car App Library on the JVM
+    testImplementation("androidx.car.app:app-testing:1.7.0")
+    testImplementation("androidx.test:core:1.7.0")
+    testImplementation("org.robolectric:robolectric:4.16.1")
 
     androidTestImplementation("androidx.test.ext:junit:1.3.0")
     androidTestImplementation("androidx.test:runner:1.7.0")

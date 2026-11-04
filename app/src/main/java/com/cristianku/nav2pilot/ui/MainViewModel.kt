@@ -21,13 +21,17 @@ import com.cristianku.nav2pilot.model.CoordinateRules
 import com.cristianku.nav2pilot.model.DongleIdRules
 import com.cristianku.nav2pilot.model.LatLng
 import com.cristianku.nav2pilot.model.PairedDevice
+import com.cristianku.nav2pilot.places.MapArea
+import com.cristianku.nav2pilot.places.OverpassPlaces
+import com.cristianku.nav2pilot.places.Place
+import com.cristianku.nav2pilot.places.PlaceCategory
 import com.cristianku.nav2pilot.resolve.DestinationResolver
 import com.cristianku.nav2pilot.resolve.ResolveOutcome
 import com.cristianku.nav2pilot.security.JwtInfo
 import com.cristianku.nav2pilot.security.TokenStore
 import com.cristianku.nav2pilot.transport.CommaAthenaTransport
-import com.cristianku.nav2pilot.transport.Delivery
 import com.cristianku.nav2pilot.transport.DemoAccount
+import com.cristianku.nav2pilot.transport.DestinationSender
 import com.cristianku.nav2pilot.transport.DeviceStatus
 import com.cristianku.nav2pilot.transport.TransportError
 import com.cristianku.nav2pilot.transport.TransportErrorText
@@ -92,6 +96,15 @@ data class MainUiState(
     val showSendTabRequest: Int = 0,
     /** Incremented when the map should move to the phone's position (the recentre button). */
     val recenterRequest: Int = 0,
+    // points of interest from OpenStreetMap on the map
+    /** The category shown (or being looked up), null when the places are hidden. */
+    val placesCategory: PlaceCategory? = null,
+    val places: List<Place> = emptyList(),
+    val placesLoading: Boolean = false,
+    /** Why no places are shown: none found, or OpenStreetMap could not answer. */
+    val placesMessage: String = "",
+    /** Incremented with each new placesMessage, so that the screen shows it once. */
+    val placesMessageRequest: Int = 0,
 )
 
 class MainViewModel(
@@ -105,6 +118,7 @@ class MainViewModel(
     private val ioDispatcher: CoroutineDispatcher,
     private val mapbox: MapboxSetup? = null,
     private val routePlanning: RoutePlanning? = null,
+    private val places: OverpassPlaces? = null,
     private val clock: () -> Long = { System.currentTimeMillis() },
 ) : ViewModel() {
 
@@ -115,9 +129,13 @@ class MainViewModel(
     val devices: StateFlow<List<PairedDevice>> = deviceRepository.devices
     val selectedDongleId: StateFlow<String> = deviceRepository.selectedDongleId
 
+    // the Mapbox token goes with every destination, before it, so the first route request of the car already uses it
+    private val sender = DestinationSender(transports) { loadMapboxToken() }
+
     private var resolveJob: Job? = null
     private var connectionJob: Job? = null
     private var routesJob: Job? = null
+    private var placesJob: Job? = null
 
     init {
         state.value = state.value.copy(
@@ -309,36 +327,10 @@ class MainViewModel(
             return
         }
         state.value = state.value.copy(sending = true, feedback = null)
+        val waypoints = plannedWaypoints()
         viewModelScope.launch {
-            // the Mapbox token goes with every destination, before it, so the first route request of the car already uses it
-            val mapboxToken = loadMapboxToken()
-            if (mapboxToken != null) {
-                sendMapboxToken(mapboxToken, device)
-            }
-            val waypoints = plannedWaypoints()
-            val result: TransportResult<Delivery>
-            if (waypoints.isEmpty()) {
-                result = transports.forDevice(device).setDestination(device, destination)
-            } else {
-                result = transports.forDevice(device).setRoute(device, destination, waypoints)
-            }
-            val feedback: SendFeedback
-            if (result is TransportResult.Ok) {
-                var message = "Destination sent to ${device.displayName()}."
-                if (waypoints.isNotEmpty()) {
-                    message = "Route sent to ${device.displayName()}."
-                }
-                if (result.value.queued) {
-                    message = "Queued by athena: ${result.value.note}"
-                } else if (result.value.note.isNotEmpty()) {
-                    message = "Destination sent to ${device.displayName()}. " + result.value.note
-                }
-                feedback = SendFeedback(true, message, clock())
-            } else {
-                val error = (result as TransportResult.Failed).error
-                feedback = SendFeedback(false, TransportErrorText.describe(error), clock())
-            }
-            state.value = state.value.copy(sending = false, feedback = feedback)
+            val outcome = sender.send(device, destination, waypoints)
+            state.value = state.value.copy(sending = false, feedback = SendFeedback(outcome.success, outcome.message, clock()))
         }
     }
 
@@ -677,6 +669,63 @@ class MainViewModel(
         refreshRoutes()
     }
 
+    // ---- points of interest ----
+
+    /**
+     * The places of [category] in [area], the part of the map the user sees (null until the map has reported it).
+     * They stay on the map until hidden or replaced by another category.
+     */
+    fun showPlaces(category: PlaceCategory, area: MapArea?) {
+        val source = places ?: return
+        placesJob?.cancel()
+        if (area == null) {
+            hidePlaces()
+            placesNotice("The map is not ready yet. Try again in a moment.")
+            return
+        }
+        val limited = area.limitedTo(PLACES_MAX_HALF_METERS)
+        state.value = state.value.copy(placesCategory = category, places = emptyList(), placesLoading = true)
+        placesJob = viewModelScope.launch {
+            val result = source.search(category, limited)
+            if (result is TransportResult.Ok) {
+                val found = result.value
+                if (found.isEmpty()) {
+                    state.value = state.value.copy(placesCategory = null, places = emptyList(), placesLoading = false)
+                    placesNotice(category.label + ": none in this part of the map.")
+                    return@launch
+                }
+                state.value = state.value.copy(places = found, placesLoading = false)
+            } else {
+                val error = (result as TransportResult.Failed).error
+                state.value = state.value.copy(placesCategory = null, places = emptyList(), placesLoading = false)
+                placesNotice(OverpassPlaces.errorText(error))
+            }
+        }
+    }
+
+    fun hidePlaces() {
+        placesJob?.cancel()
+        state.value = state.value.copy(placesCategory = null, places = emptyList(), placesLoading = false)
+    }
+
+    /** A place tapped on the map becomes the destination; the places stay, to compare or add one as a stop. */
+    fun choosePlace(place: Place) {
+        resolveJob?.cancel()
+        state.value = state.value.copy(
+            destination = place.toDestination(),
+            destinationSource = DestinationResolver.SOURCE_PLACES,
+            choices = emptyList(),
+            resolving = false,
+            resolveError = "",
+            feedback = null,
+        )
+        destinationChanged()
+    }
+
+    private fun placesNotice(message: String) {
+        state.value = state.value.copy(placesMessage = message, placesMessageRequest = state.value.placesMessageRequest + 1)
+    }
+
     /** What the device gets besides the destination: the stops, or via points of the alternative picked on the map. */
     fun plannedWaypoints(): List<RouteWaypoint> {
         val current = state.value
@@ -729,6 +778,9 @@ class MainViewModel(
         // sunnypilot setNavRoute accepts 20 waypoints; three are left for the via points of an alternative
         const val MAX_STOPS = 10
 
+        // places are looked up at most this far from the middle of the map: 50 x 50 km
+        private const val PLACES_MAX_HALF_METERS = 25_000.0
+
         private const val LOCATION_NEEDED_MESSAGE = "The route preview starts from this phone's position: allow location access."
         private const val LOCATION_DENIED_MESSAGE =
             "No location access: the route preview starts from this phone's position. Allow it in the app settings."
@@ -748,6 +800,7 @@ class MainViewModel(
                         ioDispatcher = container.ioDispatcher,
                         mapbox = container.mapbox,
                         routePlanning = container.routePlanning,
+                        places = container.places,
                     )
                     return viewModel as T
                 }
